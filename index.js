@@ -21,7 +21,7 @@ const client = new MongoClient(uri, {
   }
 });
 
-let db, ticketsCollection, usersCollection;
+let db, ticketsCollection, usersCollection, bookingsCollection;
 
 // Establish persistent MongoDB Connection Pool
 async function connectDB() {
@@ -29,7 +29,8 @@ async function connectDB() {
     await client.connect();
     db = client.db("TicketBariDB"); 
     ticketsCollection = db.collection("tickets"); 
-    usersCollection = db.collection("users"); // 👤 Used for user management tracking systems
+    usersCollection = db.collection("users"); 
+    bookingsCollection = db.collection("bookings"); 
     console.log("Successfully connected and initialized MongoDB connection node!");
   } catch (error) {
     console.error("Database connection fault:", error);
@@ -54,14 +55,31 @@ app.post('/api/tickets', async (req, res) => {
       return res.status(400).json({ error: "Missing required core ticket attributes." });
     }
 
-    // 🛑 Fraud Guard Barrier Layer
-    const vendorUser = await usersCollection.findOne({ email: ticketPayload.vendorEmail });
+    // 🛑 Fraud Guard Barrier Layer - Cleaned email tracking parameters
+    const cleanEmail = ticketPayload.vendorEmail.trim().toLowerCase();
+    const vendorUser = await usersCollection.findOne({ email: cleanEmail });
     if (vendorUser && vendorUser.role === "fraud") {
       return res.status(403).json({ error: "Access Denied. Fraudulent vendor profiles are restricted from creating listings." });
     }
 
+    // ⚡ PERFECT COUNTDOWN FIX: Normalize the incoming journeyDate value
+    let structuredJourneyDate = ticketPayload.journeyDate;
+    if (typeof structuredJourneyDate === 'string' && structuredJourneyDate.trim() !== "") {
+      if (!structuredJourneyDate.includes("T") && !structuredJourneyDate.includes(":")) {
+        structuredJourneyDate = `${structuredJourneyDate}T09:00:00`;
+      }
+    }
+
+    // Ensure metrics are securely saved as native Number datatypes
+    const cleanQuantity = ticketPayload.quantity ? Number(ticketPayload.quantity) : 0;
+    const cleanPrice = ticketPayload.price ? Number(ticketPayload.price) : 0;
+
     const result = await ticketsCollection.insertOne({
       ...ticketPayload,
+      vendorEmail: cleanEmail,
+      quantity: cleanQuantity,
+      price: cleanPrice,
+      journeyDate: structuredJourneyDate, 
       status: "pending",       
       isAdvertised: "Pending", 
       createdAt: new Date() 
@@ -78,12 +96,13 @@ app.post('/api/tickets', async (req, res) => {
 app.get('/api/tickets/vendor', async (req, res) => {
   try {
     const { email } = req.query;
-
     if (!email) {
       return res.status(400).json({ error: "Vendor tracking identifier query email parameter missing." });
     }
-
-    const vendorTickets = await ticketsCollection.find({ vendorEmail: email }).sort({ createdAt: -1 }).toArray();
+    const vendorTickets = await ticketsCollection
+      .find({ vendorEmail: email.trim().toLowerCase() })
+      .sort({ createdAt: -1 })
+      .toArray();
     res.status(200).json(vendorTickets);
   } catch (err) {
     console.error("Failed fetching vendor collection:", err);
@@ -169,12 +188,11 @@ app.get('/api/tickets/approved', async (req, res) => {
   }
 });
 
-// ⚡ 8. NEW FIXED GET ROUTE: Fetch a single ticket by its dynamic Hex ID parameter string
+// 8. GET Route: Fetch a single ticket by its dynamic Hex ID parameter string
 app.get('/api/tickets/:id', async (req, res) => {
   try {
     const { id } = req.params;
 
-    // Validate if incoming string matches standard MongoDB 24-character hex generation layout
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({ error: "Malformed structural ID node syntax matching criteria parameters." });
     }
@@ -192,7 +210,128 @@ app.get('/api/tickets/:id', async (req, res) => {
   }
 });
 
-// 👥 9. GET Route: Fetch ALL users for Manage Users Section Panel
+// 🎟️ 9. ENHANCED POST Route: Process a user ticket reservation and trace it to the Vendor
+app.post('/api/bookings', async (req, res) => {
+  try {
+    const { ticketId, userEmail, userName, quantity, totalPrice, bookedAt } = req.body;
+
+    if (!ticketId || !userEmail || !quantity || !totalPrice) {
+      return res.status(400).json({ error: "Missing required core booking metrics parameters." });
+    }
+
+    // 🛡️ SERVER-SIDE AUTHORIZATION SECURITY LAYER
+    const dbUserProfile = await usersCollection.findOne({ email: userEmail.trim().toLowerCase() });
+    if (!dbUserProfile || dbUserProfile.role !== "user") {
+      return res.status(403).json({ 
+        error: "Access Forbidden: Only registered tier 'user' accounts are authorized to book reservations." 
+      });
+    }
+
+    if (!ObjectId.isValid(ticketId)) {
+      return res.status(400).json({ error: "Provided ticket identifier signature syntax is invalid." });
+    }
+
+    const ticketObjectId = new ObjectId(ticketId);
+
+    // Verify inventory availability metrics before processing write states
+    const targetTicket = await ticketsCollection.findOne({ _id: ticketObjectId });
+    if (!targetTicket) {
+      return res.status(404).json({ error: "Ticket manifest reference point not found." });
+    }
+
+    // 🛠️ CRITICAL CONVERSION: Force parsing string fields to native integers
+    const availableQuantity = Number(targetTicket.quantity) || 0;
+    const requestedQuantity = Number(quantity);
+
+    if (availableQuantity < requestedQuantity) {
+      return res.status(400).json({ error: "Requested quantity exceeds current available stock parameters." });
+    }
+
+    // Build the finalized booking profile ledger payload
+    const bookingPayload = {
+      ticketId: ticketObjectId,
+      title: targetTicket.title,
+      from: targetTicket.from,
+      to: targetTicket.to,
+      transportType: targetTicket.transportType || targetTicket.type || "Bus",
+      journeyDate: targetTicket.journeyDate,
+      vendorEmail: targetTicket.vendorEmail?.trim().toLowerCase(), 
+      userEmail: userEmail.trim().toLowerCase(),
+      userName: userName || "Anonymous User",
+      quantity: requestedQuantity,
+      totalPrice: Number(totalPrice),
+      status: "Confirmed",
+      bookedAt: bookedAt ? new Date(bookedAt) : new Date()
+    };
+
+    // Execute booking insert statement
+    const bookingResult = await bookingsCollection.insertOne(bookingPayload);
+
+    // ⚡ SANITIZE STOCK DECREMENT PIPELINE
+    if (typeof targetTicket.quantity === 'string') {
+      await ticketsCollection.updateOne(
+        { _id: ticketObjectId },
+        { $set: { quantity: (availableQuantity - requestedQuantity) } }
+      );
+    } else {
+      await ticketsCollection.updateOne(
+        { _id: ticketObjectId },
+        { $inc: { quantity: -requestedQuantity } }
+      );
+    }
+
+    res.status(201).json({ 
+      success: true, 
+      message: "Reservation payload successfully securely committed to data cluster.", 
+      bookingId: bookingResult.insertedId 
+    });
+  } catch (err) {
+    console.error("Failed writing booking node document segment:", err);
+    res.status(500).json({ error: `Database pipeline fault: ${err.message}` });
+  }
+});
+
+// 🎟️ 10. GET Route: Fetch unique booked tickets filtered specifically by logged-in user email
+app.get('/api/bookings/user', async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) {
+      return res.status(400).json({ error: "User tracking identifier query email parameter missing." });
+    }
+
+    const userBookings = await bookingsCollection
+      .find({ userEmail: email.trim().toLowerCase() })
+      .sort({ bookedAt: -1 })
+      .toArray();
+
+    res.status(200).json(userBookings);
+  } catch (err) {
+    console.error("Failed fetching user dashboard bookings matrix layout:", err);
+    res.status(500).json({ error: "Internal server data block parsing fault." });
+  }
+});
+
+// 🎟️ 14. NEW GET Route: Fetch incoming bookings belonging directly to a specific vendor's tickets
+app.get('/api/bookings/vendor', async (req, res) => {
+  try {
+    const { email } = req.query;
+    if (!email) {
+      return res.status(400).json({ error: "Vendor mapping identifying parameter missing." });
+    }
+
+    const incomingRequests = await bookingsCollection
+      .find({ vendorEmail: email.trim().toLowerCase() })
+      .sort({ bookedAt: -1 })
+      .toArray();
+
+    res.status(200).json(incomingRequests);
+  } catch (err) {
+    console.error("Failed pulling vendor order queue items:", err);
+    res.status(500).json({ error: "Internal server handling booking stream fault." });
+  }
+});
+
+// 👥 11. GET Route: Fetch ALL users for Manage Users Section Panel
 app.get('/api/users', async (req, res) => {
   try {
     const allUsers = await usersCollection.find({}).toArray();
@@ -203,26 +342,25 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// 🔨 10. PATCH Route: Mutate User Roles (Handles admin, vendor, and fraud cascade deletions)
+// 12. PATCH Route: Mutate User Roles (Handles admin, vendor, and fraud cascade deletions)
 app.patch('/api/users/:id/role', async (req, res) => {
   try {
     const { id } = req.params;
-    const { role, email } = req.body; // Expects values: "user", "admin", "vendor", "fraud"
+    const { role, email } = req.body; 
 
     if (!["user", "admin", "vendor", "fraud"].includes(role)) {
       return res.status(400).json({ error: "Invalid systemic role identity assignment value matches." });
     }
 
-    // Mutate targeted profile node role field
     const userUpdateResult = await usersCollection.updateOne(
       { _id: new ObjectId(id) },
       { $set: { role: role } }
     );
 
-    // ⚡ FRAUD CASCADE RULE: If flagged blacklisted as fraud, drop all active database site tickets instantly
+    // 🛑 FRAUD CASCADE RULE
     if (role === "fraud" && email) {
       await ticketsCollection.updateMany(
-        { vendorEmail: email },
+        { vendorEmail: email.trim().toLowerCase() },
         { 
           $set: { 
             status: "Rejected", 
@@ -240,26 +378,29 @@ app.patch('/api/users/:id/role', async (req, res) => {
   }
 });
 
-// 👤 11. NEW POST Route: Auto-Sync authenticated users into the `users` collection
+// 👤 13. NEW POST Route: Auto-Sync authenticated users into the `users` collection
 app.post('/api/users/sync', async (req, res) => {
   try {
-    const { email, name, image } = req.body;
+    const { email, name, image, role } = req.body; // ✅ Extract role from body payload
 
     if (!email) {
       return res.status(400).json({ error: "Email tracking identifier is required to sync user profile." });
     }
 
-    // Uses an update with an upsert flag: sets basic info, preserves existing assigned role if it already exists
+    const cleanEmail = email.trim().toLowerCase();
+    const finalRole = role || "user"; // ✅ Fallback to "user" if no role parameter is sent
+
+    // Synergized to save fields mapping cleanly to client keys
     const result = await usersCollection.updateOne(
-      { email: email },
+      { email: cleanEmail },
       { 
         $set: { 
           name: name || "Anonymous User", 
-          photo: image || "",
+          image: image || "", // Unified database to field 'image' to match your components perfectly!
+          role: finalRole,    // ✅ Actively upsert or track updates to role assignment strings
           lastActive: new Date()
         },
         $setOnInsert: { 
-          role: "user", // Default systemic assignment tier for brand new accounts
           createdAt: new Date()
         } 
       },
@@ -271,6 +412,16 @@ app.post('/api/users/sync', async (req, res) => {
     console.error("Failed executing user profile upsert routine:", err);
     res.status(500).json({ error: "Internal server data layer exception during user sync." });
   }
+});
+
+// --- JSON FALLBACK ERROR HANDLERS ---
+app.use((req, res) => {
+  res.status(404).json({ error: `System node route path configuration error: ${req.originalUrl} does not exist.` });
+});
+
+app.use((err, req, res, next) => {
+  console.error("Critical Matrix Layer Interruption:", err.stack);
+  res.status(500).json({ error: "A major database processing or transmission failure crash pattern occurred." });
 });
 
 app.listen(port, () => {
